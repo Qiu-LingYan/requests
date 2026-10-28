@@ -62,6 +62,7 @@ from .exceptions import (
     InvalidJSONError,
     InvalidURL,
     MissingSchema,
+    RequestException,
     StreamConsumedError,
 )
 from .exceptions import JSONDecodeError as RequestsJSONDecodeError
@@ -736,6 +737,7 @@ class Response:
 
     _content: bytes | Literal[False] | None
     _content_consumed: bool
+    _content_error: BaseException | None
     _next: PreparedRequest | None
     status_code: int
     headers: CaseInsensitiveDict[str]
@@ -765,6 +767,7 @@ class Response:
     def __init__(self) -> None:
         self._content = False
         self._content_consumed = False
+        self._content_error = None
         self._next = None
 
         #: Integer Code of responded HTTP Status, e.g. 404 or 200.
@@ -933,27 +936,34 @@ class Response:
         """
 
         def generate() -> Generator[bytes, None, None]:
-            # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
-                    yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
-            else:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
+            try:
+                # Special case for urllib3.
+                if hasattr(self.raw, "stream"):
+                    try:
+                        yield from self.raw.stream(chunk_size, decode_content=True)
+                    except ProtocolError as e:
+                        raise ChunkedEncodingError(e)
+                    except DecodeError as e:
+                        raise ContentDecodingError(e)
+                    except ReadTimeoutError as e:
+                        raise ConnectionError(e)
+                    except SSLError as e:
+                        raise RequestsSSLError(e)
+                else:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
 
-            self._content_consumed = True
+                self._content_consumed = True
+            except RequestException as e:
+                # Remember the failure so that every read API raises the
+                # same error on subsequent accesses instead of silently
+                # returning an empty or partial result.
+                self._content_error = e
+                raise
 
         if self._content_consumed and isinstance(self._content, bool):
             raise StreamConsumedError()
@@ -963,6 +973,9 @@ class Response:
             raise TypeError(
                 f"chunk_size must be an int, it is instead a {type(chunk_size)}."
             )
+
+        if self._content_error is not None:
+            raise self._content_error
 
         if self._content_consumed:
             # simulate reading small chunks of the content
@@ -1037,6 +1050,8 @@ class Response:
 
         if self._content is False:
             # Read the contents.
+            if self._content_error is not None:
+                raise self._content_error
             if self._content_consumed:
                 raise RuntimeError("The content for this response was already consumed")
 

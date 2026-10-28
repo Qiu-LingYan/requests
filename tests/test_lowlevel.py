@@ -426,3 +426,79 @@ def test_json_decode_compatibility_for_alt_utf_encodings():
     assert isinstance(excinfo.value, requests.exceptions.RequestException)
     assert isinstance(excinfo.value, JSONDecodeError)
     assert r.text not in str(excinfo.value)
+
+
+def incomplete_chunked_response_handler(sock):
+    """Send a valid 2-byte chunk, then a chunk header declaring 8 bytes
+    followed by only 3 bytes and a premature close."""
+    consume_socket_content(sock, timeout=0.5)
+    sock.send(
+        b'HTTP/1.1 200 OK\r\n'
+        b'Transfer-Encoding: chunked\r\n'
+        b'\r\n'
+        b'2\r\n42\r\n'
+        b'8\r\n123\r\n'
+    )
+
+
+def test_content_retains_error_on_second_access():
+    """Accessing content after a read error re-raises the error.
+
+    See https://github.com/psf/requests/issues/4965
+    """
+    close_server = threading.Event()
+    server = Server(incomplete_chunked_response_handler, wait_to_close_event=close_server)
+
+    with server as (host, port):
+        url = f'http://{host}:{port}/'
+        r = requests.get(url, stream=True)
+        with pytest.raises(requests.exceptions.ChunkedEncodingError):
+            r.content
+        close_server.set()
+
+    # Every later read attempt replays the error instead of silently
+    # returning an empty or partial body.
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        r.content
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        r.text
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        list(r)
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        list(r.iter_lines())
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        list(r.iter_content(chunk_size=1))
+
+
+def test_iter_content_retains_error_on_second_call():
+    """Calling iter_content again after a mid-stream error re-raises it."""
+    close_server = threading.Event()
+    server = Server(incomplete_chunked_response_handler, wait_to_close_event=close_server)
+
+    with server as (host, port):
+        url = f'http://{host}:{port}/'
+        r = requests.get(url, stream=True)
+        with pytest.raises(requests.exceptions.ChunkedEncodingError):
+            list(r.iter_content())
+        close_server.set()
+
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        list(r.iter_content())
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        list(r.iter_lines())
+
+
+def test_successful_read_not_affected():
+    """A completed read caches its content; repeated reads stay error-free."""
+    close_server = threading.Event()
+    server = Server.basic_response_server(wait_to_close_event=close_server)
+
+    with server as (host, port):
+        url = f'http://{host}:{port}/'
+        r = requests.get(url, stream=True)
+        assert r.content == b''
+        close_server.set()
+
+    assert r.content == b''
+    assert r.text == ''
+    assert list(r) == []
